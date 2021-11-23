@@ -5,7 +5,6 @@ import lombok.extern.slf4j.Slf4j;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashSet;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -47,17 +46,22 @@ interface RejectPolicy<T>{
     void reject(BlockingQueue<T>queue,T task);
 }
 
+@FunctionalInterface // 拒绝策略
+interface RejectPolicy<T> {
+    void reject(BlockingQueue<T> queue, T task);
+}
 //自定义阻塞队列
 @Slf4j(topic = "c.BlockingQueue")
 class BlockingQueue<T>{
-    public BlockingQueue(int capacity) {
-        this.capacity = capacity;
-    }
-
     //队列
     Deque<T> queue = new ArrayDeque<>();
     //最大容量
     int capacity;
+
+    public BlockingQueue(int capacity) {
+        this.capacity = capacity;
+    }
+
     //锁
     ReentrantLock lock = new ReentrantLock();
     //队列添加条件变量
@@ -72,16 +76,15 @@ class BlockingQueue<T>{
        try{
            while (queue.isEmpty()){
                try {
-                   emptyWaitSet.await();
+                   fullWaitSet.await();
                } catch (InterruptedException e) {
                    e.printStackTrace();
                }
            }
            //获取队列的队头元素
            T t = queue.removeFirst();
-           log.debug("从任务队列移除： {} ...", t);
            //有元素，增加条件变量
-           fullWaitSet.signal();
+           emptyWaitSet.signal();
            return t;
        }finally {
            lock.unlock();
@@ -100,16 +103,15 @@ class BlockingQueue<T>{
                 if(nanos <= 0)return null;
                 try {
                     //边等待边计算剩余时间
-                    nanos = emptyWaitSet.awaitNanos(nanos);
+                    nanos = fullWaitSet.awaitNanos(nanos);
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
             }
-
             //获取队列的队头元素
             T t = queue.removeFirst();
             //有元素，增加条件变量
-            fullWaitSet.signal();
+            emptyWaitSet.signal();
             return t;
         }finally {
             lock.unlock();
@@ -124,14 +126,12 @@ class BlockingQueue<T>{
         try {
             while (queue.size() == capacity){
                 try {
-                    log.debug("等待加入任务队列 {} ...", t);
                     fullWaitSet.await();
                 }catch (InterruptedException e) {
                     e.printStackTrace();
                 }
 
             }
-            log.debug("加入任务队列 {}", t);
             queue.addLast(t);
             emptyWaitSet.signal();
         }  finally {
@@ -147,14 +147,12 @@ class BlockingQueue<T>{
             while (queue.size() == capacity){
                 if(nanos <= 0)return false;
                 try {
-                    log.debug("等待加入任务队列 {} ...", t);
                     nanos = fullWaitSet.awaitNanos(nanos);
                 }catch (InterruptedException e){
                     e.printStackTrace();
                 }
 
             }
-            log.debug("加入任务队列 {}", t);
             queue.addLast(t);
             emptyWaitSet.signal();
             return true;
@@ -163,104 +161,62 @@ class BlockingQueue<T>{
         }
     }
 
-    //设置策略的队列添加
-    public void tryPut(RejectPolicy<T> rejectPolicy,T task){
-        lock.lock();
-        try {
-            if(queue.size() < capacity){
-                queue.addLast(task);
-                emptyWaitSet.signal();
-            }
-            else {
-                log.debug("加入任务队列 {}", task);
-                rejectPolicy.reject(this,task);
-            }
-        }catch (Exception e){
-            e.printStackTrace();
-        }finally {
-            lock.unlock();
-        }
-
-    }
 
 }
+
+
 @Slf4j(topic = "c.ThreadPool")
 class ThreadPool{
     //阻塞队列
     private BlockingQueue<Runnable> blockingQueue;
-    //任务集合 ，并发集合应该是final的
-
-    private final Set<Worker> workerSet = new HashSet<>();
     //核心线程数
-    private int coreSize;
-    //最长等待时间
-    private long TimeOut;
-    //时间单位
+    private Integer coreSize;
+    //核心线程集合
+    private HashSet<Worker> workers= new HashSet<>();
+    private long timeout;
     private TimeUnit timeUnit;
-
     private RejectPolicy<Runnable> rejectPolicy;
-    public ThreadPool(int queueSize, int coreSize, long timeOut, TimeUnit timeUnit,RejectPolicy<Runnable> rejectPolicy) {
-        this.blockingQueue = new BlockingQueue<>(queueSize);
+    public ThreadPool(int coreSize, long timeout, TimeUnit timeUnit, int queueCapcity,
+                      RejectPolicy<Runnable> rejectPolicy) {
         this.coreSize = coreSize;
-        TimeOut = timeOut;
+        this.timeout = timeout;
         this.timeUnit = timeUnit;
+        this.blockingQueue = new BlockingQueue<>(queueCapcity);
         this.rejectPolicy = rejectPolicy;
     }
 
-    //TODO 线程池执行任务方法
-
-
     public void execute(Runnable task){
-        //如果当前核心数未达到上限，创建核心线程
-        //必须互斥操作核心线程集合，可以用并发集合优化
-        synchronized (workerSet){
-            if(workerSet.size() < coreSize){
-                Worker worker = new Worker(task);
-                log.debug("新增 worker{}, {}", worker, task);
-                workerSet.add(worker);
-                worker.start();
-            }
-            else {
-    //            blockingQueue.put(task);
-                //自定义等待策略
-                //1. 死等
-                //2. 超时等待
-                //3. 抛出异常
-                //4. 放弃执行
-                //5. 调用者线程自己执行
-
-                rejectPolicy.reject(blockingQueue,task);
-            }
+        //判断核心线程数是否已满，未满添加，满了交给阻塞队列
+        if(workers.size() < coreSize){
+            Worker worker = new Worker(task);
+            workers.add(worker);
+            worker.start();
+        }
+        else {
+            blockingQueue.put(task);
+            //TODO 更改为选择拒绝策略的添加
         }
     }
 
     class Worker extends Thread{
-         Runnable task;
+        private Runnable task;
         Worker(Runnable task){
-
             this.task = task;
         }
 
         @Override
         public void run() {
-            //当前没有任务，从阻塞队列中获取
-            while (task!=null || (task = blockingQueue.take())!=null){
-                try{
-                    log.debug("线程运行中：{}",task);
+            while (task != null || (task = blockingQueue.take())!=null){
+                try {
+                    log.debug("任务{}开始执行",task);
                     task.run();
                 }catch (Exception e){
                     e.printStackTrace();
                 }finally {
-                    task =null;
+                    task = null;
                 }
+
             }
-
-            synchronized (workerSet){
-                log.debug("{}从workers中移除",this);
-                workerSet.remove(this);
-            }
-
-
         }
     }
 }
