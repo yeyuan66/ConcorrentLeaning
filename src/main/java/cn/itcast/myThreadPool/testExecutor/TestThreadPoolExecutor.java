@@ -1,4 +1,4 @@
-package cn.itcast.myThreadPool;
+package cn.itcast.myThreadPool.testExecutor;
 
 import lombok.extern.slf4j.Slf4j;
 
